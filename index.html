@@ -12,7 +12,7 @@ main{max-width:1050px;margin:auto;padding:24px 16px 40px}h1{margin:0 0 8px}p{col
 .panel{min-width:0;padding:16px;border:1px solid var(--line);border-radius:16px;background:var(--panel)}
 .video{position:relative;aspect-ratio:4/3;background:#03060d;border-radius:12px;overflow:hidden}
 video,canvas{position:absolute;width:100%;height:100%;inset:0;object-fit:cover}
-video,canvas{transform:scaleX(-1)}#video{opacity:0}#overlay{pointer-events:none}
+video,canvas{transform:scaleX(-1)}#overlay{pointer-events:none}
 .buttons{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
 button{padding:11px 15px;border:0;border-radius:10px;font-weight:700;cursor:pointer;background:var(--green);color:#092319}
 button.secondary{background:#293753;color:var(--text);border:1px solid #465776}
@@ -22,6 +22,7 @@ button:disabled{opacity:.55;cursor:not-allowed}
 .status.ok{color:#c9ffe8;background:#123329;border:1px solid #286b55}
 .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
 .metric{background:#0d1629;border:1px solid var(--line);padding:12px;border-radius:10px}
+.metric.wide{grid-column:1/-1}
 .metric span{display:block;color:var(--muted);font-size:.85rem;margin-bottom:6px}
 .metric strong{font-size:1.2rem;overflow-wrap:anywhere}
 .warning{display:none;margin-top:12px;background:#4b2028;color:#ffe1e3;padding:12px;border-radius:10px}
@@ -58,8 +59,9 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <div class="metric"><span>Y · 상하 위치</span><strong id="y">—</strong></div>
 <div class="metric"><span>Z · 거리 추정</span><strong id="z">—</strong></div>
 <div class="metric"><span>Pitch · 위아래 회전</span><strong id="pitch">—</strong></div>
+<div class="metric"><span>Yaw · 좌우 회전</span><strong id="yaw">—</strong></div>
 <div class="metric"><span>Roll · 좌우 기울기</span><strong id="roll">—</strong></div>
-<div class="metric"><span>상태</span><strong id="faceState">대기 중</strong></div>
+<div class="metric wide"><span>상태</span><strong id="faceState">대기 중</strong></div>
 </div>
 <p class="small">처음 실행할 때 얼굴 인식 모델과 OpenCV.js를 인터넷에서 불러옵니다. 네트워크에서 외부 라이브러리를 차단하면 실행되지 않을 수 있습니다.</p>
 </section>
@@ -69,41 +71,60 @@ button:disabled{opacity:.55;cursor:not-allowed}
 const $=id=>document.getElementById(id);
 const video=$('video'), canvas=$('overlay'), ctx=canvas.getContext('2d');
 const startBtn=$('start'), stopBtn=$('stop'), statusEl=$('status'), warning=$('warning');
-let stream=null, landmarker=null, running=false, lastTime=-1, cvReady=null;
+let stream=null, landmarker=null, running=false, lastTime=-1, cvReady=null, smooth=null;
+const SMOOTHING=0.35;
 const ids=[1,152,33,263,61,291];
-const modelPoints=[[0,0,0],[0,63,-12],[-43,-32,-26],[43,-32,-26],[-28,30,-20],[28,30,-20]];
+// 카메라 좌표계(x 오른쪽, y 아래, z 멀어짐)와 같은 방향의 평균 얼굴 모델(mm)
+const modelPoints=[[0,0,0],[0,63,12],[-43,-32,26],[43,-32,26],[-28,30,20],[28,30,20]];
 function status(msg,type=''){statusEl.className='status '+type;statusEl.textContent=msg}
-function clearMetrics(){['x','y','z','pitch','roll'].forEach(id=>$(id).textContent='—');$('faceState').textContent='얼굴 없음';warning.style.display='none'}
+function clearMetrics(){['x','y','z','pitch','yaw','roll'].forEach(id=>$(id).textContent='—');$('faceState').textContent='얼굴 없음';warning.style.display='none';smooth=null}
 async function requestCamera(){
   if(!window.isSecureContext){throw new Error('안전한 연결(HTTPS)이 아닙니다. GitHub Pages의 https:// 주소로 접속하세요.')}
   if(!navigator.mediaDevices?.getUserMedia){throw new Error('이 브라우저에서 카메라 API를 사용할 수 없습니다. 최신 Chrome에서 HTTPS 주소로 접속하세요.')}
-  // This is called directly from the button click so the browser can show its permission prompt.
   return await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:false});
+}
+function loadScript(src,timeoutMs=30000){
+  return new Promise((resolve,reject)=>{
+    const s=document.createElement('script');
+    s.src=src;
+    s.onload=()=>{
+      const start=Date.now(),timer=setInterval(()=>{
+        if(window.cv?.Mat){clearInterval(timer);resolve(window.cv)}
+        else if(Date.now()-start>timeoutMs){clearInterval(timer);reject(new Error('OpenCV.js 초기화 시간 초과'))}
+      },100);
+    };
+    s.onerror=()=>{s.remove();reject(new Error('다운로드 실패: '+src))};
+    document.head.appendChild(s);
+  });
 }
 async function loadCV(){
   if(window.cv?.Mat)return window.cv;
   if(cvReady)return cvReady;
-  cvReady=new Promise((resolve,reject)=>{
-    const script=document.createElement('script');
-    script.src='https://docs.opencv.org/4.x/opencv.js';
-    script.onload=()=>{
-      const start=Date.now(), timer=setInterval(()=>{
-        if(window.cv?.Mat){clearInterval(timer);resolve(window.cv)}
-        else if(Date.now()-start>30000){clearInterval(timer);reject(new Error('OpenCV.js 초기화 시간이 초과되었습니다. 네트워크나 브라우저 확장 프로그램을 확인하세요.'))}
-      },100);
-    };
-    script.onerror=()=>reject(new Error('OpenCV.js 다운로드 실패: 인터넷 연결 또는 네트워크 차단을 확인하세요.'));
-    document.head.appendChild(script);
-  });
+  cvReady=(async()=>{
+    const urls=['https://docs.opencv.org/4.x/opencv.js','https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.5/dist/opencv.js'];
+    let last=null;
+    for(const u of urls){try{return await loadScript(u)}catch(e){last=e}}
+    cvReady=null;
+    throw new Error('OpenCV.js를 불러오지 못했습니다. 네트워크 차단이나 확장 프로그램을 확인하세요. ('+(last?.message||last)+')');
+  })();
   return cvReady;
 }
 async function loadFaceModel(){
-  const vision=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22');
-  const files=await vision.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
-  return vision.FaceLandmarker.createFromOptions(files,{
-    baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:'GPU'},
-    runningMode:'VIDEO',numFaces:1
-  });
+  const bases=[
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21',
+    'https://unpkg.com/@mediapipe/tasks-vision@0.10.21',
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14'
+  ];
+  let vision=null, base='', lastErr=null;
+  for(const b of bases){
+    try{ vision=await import(`${b}/vision_bundle.mjs`); base=b; break; }
+    catch(e){ lastErr=e; }
+  }
+  if(!vision) throw new Error('MediaPipe 라이브러리를 불러오지 못했습니다. 네트워크 차단 여부를 확인하세요. ('+(lastErr?.message||lastErr)+')');
+  const files=await vision.FilesetResolver.forVisionTasks(`${base}/wasm`);
+  const baseOptions={modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'};
+  const make=delegate=>vision.FaceLandmarker.createFromOptions(files,{baseOptions:{...baseOptions,delegate},runningMode:'VIDEO',numFaces:1});
+  try{return await make('GPU')}catch(e){console.warn('GPU 실패, CPU로 재시도',e);return await make('CPU')}
 }
 function drawFace(lm){
   const w=canvas.width,h=canvas.height,xx=lm.map(p=>p.x*w),yy=lm.map(p=>p.y*h);
@@ -117,14 +138,17 @@ function pose(lm,cv){
   const obj=cv.matFromArray(6,3,cv.CV_64F,modelPoints.flat());
   const ip=cv.matFromArray(6,2,cv.CV_64F,img.flat());
   const f=w, cam=cv.matFromArray(3,3,cv.CV_64F,[f,0,w/2,0,f,h/2,0,0,1]);
-  const dist=cv.Mat.zeros(4,1,cv.CV_64F),r=new cv.Mat(),t=new cv.Mat();
+  const dist=cv.Mat.zeros(4,1,cv.CV_64F),r=new cv.Mat(),t=new cv.Mat(),rot=new cv.Mat();
   try{
     if(!cv.solvePnP(obj,ip,cam,dist,r,t,false,cv.SOLVEPNP_ITERATIVE))return null;
-    const rot=new cv.Mat();cv.Rodrigues(r,rot);
-    const pitch=Math.atan2(rot.doubleAt(2,1),rot.doubleAt(2,2))*180/Math.PI;
-    const roll=Math.atan2(rot.doubleAt(1,0),rot.doubleAt(0,0))*180/Math.PI;
-    const out={x:t.doubleAt(0,0),y:t.doubleAt(1,0),z:t.doubleAt(2,0),pitch,roll};rot.delete();return out;
-  }finally{obj.delete();ip.delete();cam.delete();dist.delete();r.delete();t.delete()}
+    cv.Rodrigues(r,rot);
+    const R=(i,j)=>rot.doubleAt(i,j), D=180/Math.PI;
+    // R = Rz(roll)·Ry(yaw)·Rx(pitch), 정면이면 모두 0° 근처
+    const pitch=Math.atan2(R(2,1),R(2,2))*D;
+    const yaw=Math.atan2(-R(2,0),Math.hypot(R(2,1),R(2,2)))*D;
+    const roll=Math.atan2(R(1,0),R(0,0))*D;
+    return [t.doubleAt(0,0),t.doubleAt(1,0),t.doubleAt(2,0),pitch,yaw,roll];
+  }finally{obj.delete();ip.delete();cam.delete();dist.delete();r.delete();t.delete();rot.delete()}
 }
 function loop(){
   if(!running)return;
@@ -133,24 +157,30 @@ function loop(){
     const res=landmarker.detectForVideo(video,performance.now());
     if(res.faceLandmarks?.length){
       const lm=res.faceLandmarks[0];drawFace(lm);
-      try{const p=pose(lm,window.cv);if(p){
-        $('x').textContent=p.x.toFixed(1)+' mm';$('y').textContent=p.y.toFixed(1)+' mm';$('z').textContent=p.z.toFixed(1)+' mm*';
-        $('pitch').textContent=p.pitch.toFixed(1)+'°';$('roll').textContent=p.roll.toFixed(1)+'°';$('faceState').textContent='추적 중';
-        warning.style.display=p.z>0&&p.z<350?'block':'none';
-      }}catch(e){$('faceState').textContent='측정 중'}
+      try{
+        const v=pose(lm,window.cv);
+        if(v){
+          smooth=smooth?v.map((n,i)=>SMOOTHING*n+(1-SMOOTHING)*smooth[i]):v;
+          const [x,y,z,pitch,yaw,roll]=smooth;
+          $('x').textContent=x.toFixed(1)+' mm';$('y').textContent=y.toFixed(1)+' mm';$('z').textContent=z.toFixed(1)+' mm*';
+          $('pitch').textContent=pitch.toFixed(1)+'°';$('yaw').textContent=yaw.toFixed(1)+'°';$('roll').textContent=roll.toFixed(1)+'°';
+          $('faceState').textContent='추적 중';
+          warning.style.display=z>0&&z<350?'block':'none';
+        }
+      }catch(e){$('faceState').textContent='측정 중'}
       status('카메라가 켜져 있고 얼굴을 추적하고 있습니다.','ok');
     }else{ctx.clearRect(0,0,canvas.width,canvas.height);clearMetrics();status('얼굴이 보이지 않습니다. 카메라를 향해 주세요.')}
   }
   requestAnimationFrame(loop);
 }
 startBtn.addEventListener('click',async()=>{
-  startBtn.disabled=true;status('브라우저에 카메라 권한을 요청하고 있습니다. 권한 창에서 허용을 선택하세요.'); 
+  startBtn.disabled=true;status('브라우저에 카메라 권한을 요청하고 있습니다. 권한 창에서 허용을 선택하세요.');
   try{
-    stream=await requestCamera(); // Must happen from explicit user click.
+    stream=await requestCamera();
     video.srcObject=stream;await video.play();
-    status('카메라 허용됨. 얼굴 인식 모델을 불러오는 중입니다...');
+    status('카메라 허용됨. 얼굴 인식 모델을 불러오는 중입니다... (처음에는 수십 초 걸릴 수 있습니다)');
     const loaded=await Promise.all([loadFaceModel(),loadCV()]);
-    landmarker=loaded[0];running=true;lastTime=-1;stopBtn.disabled=false;
+    landmarker=loaded[0];running=true;lastTime=-1;smooth=null;stopBtn.disabled=false;
     status('준비 완료. 얼굴을 카메라 앞에 비춰 주세요.','ok');requestAnimationFrame(loop);
   }catch(e){
     if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;startBtn.disabled=false;
